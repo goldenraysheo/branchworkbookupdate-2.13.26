@@ -116,6 +116,7 @@ function processRawUpload() {
 
   // Write result to monthly sheet, named like "P10-Oct"
   const monthly = upsertSheet_(ss, periodCode);
+  removeExistingProtections_(monthly);
   monthly.clear();
 
   // Row 1: header (with instructions in Comments cell)
@@ -214,6 +215,15 @@ function normalizeLabel_(s) {
     .replace(/[^\w\s]/g,'')
     .trim()
     .toLowerCase();
+}
+
+/**
+ * Remove all existing protections (sheet-level and range-level) from a sheet
+ * so the script can write to it regardless of who previously ran the script.
+ */
+function removeExistingProtections_(sheet) {
+  sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => p.remove());
+  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => p.remove());
 }
 
 function upsertSheet_(ss, name) {
@@ -407,7 +417,7 @@ function boldLabelRows_(sheet, outHeader) {
  * Protect P-tab so only Comments column (rows 2+) is editable by normal editors.
  * - Entire sheet is protected
  * - Column "Comments" (from row 2 down) is unprotected
- * - Only the script owner remains as an allowed editor for the protection
+ * - The spreadsheet owner and the user who ran the script remain as allowed editors
  */
 function protectAllButComments_(sheet, outHeader) {
   const commentsCol = outHeader.indexOf(COMMENTS_HEADER)+1;
@@ -430,17 +440,23 @@ function protectAllButComments_(sheet, outHeader) {
   );
   prot.setUnprotectedRanges([editableRange]);
 
-  // Restrict who can bypass this protection: remove all editors except the script owner.
+  // Keep both the spreadsheet owner and the current user as editors.
+  // This prevents the owner from being locked out when someone else runs the script.
   const me = Session.getEffectiveUser().getEmail();
+  const owner = sheet.getParent().getOwner();
+  const ownerEmail = owner ? owner.getEmail() : null;
+  const keepEmails = ownerEmail ? [me, ownerEmail] : [me];
+
   const editors = prot.getEditors();
-  const toRemove = editors.filter(u => u.getEmail && u.getEmail() !== me);
+  const toRemove = editors.filter(u => u.getEmail && !keepEmails.includes(u.getEmail()));
   if (toRemove.length) {
     prot.removeEditors(toRemove);
   }
+  if (ownerEmail && ownerEmail !== me) {
+    prot.addEditor(ownerEmail);
+  }
 
   prot.setDomainEdit(false);
-  // If you want another super-editor, add them here:
-  // prot.addEditor('finance@yourorg.org');
 }
 
 /**
@@ -767,6 +783,9 @@ function updateDeptOverview_(ss) {
   const overview = ss.getSheetByName('Dept Overview');
   if (!overview) return;
 
+  // Remove existing protections first so the script can write to this sheet
+  removeExistingProtections_(overview);
+
   // Build dept code -> name map from Dept_Names sheet
   const deptNameSheet = ss.getSheetByName('Dept_Names');
   const deptNameMap = {};
@@ -1053,15 +1072,22 @@ if (last >= 1) {
       // --- Protect Dept Overview (view-only for all non-owners/editors) ---
   {
     // Remove old protections
-    overview.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => p.remove());
-    overview.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => p.remove());
+    removeExistingProtections_(overview);
 
     // Protect entire sheet
     const prot = overview.protect().setDescription('Dept Overview - Locked');
 
-    // Remove domain editors so only the script owner retains full rights
-    const me = Session.getEffectiveUser();
-    prot.removeEditors(prot.getEditors().filter(e => e.getEmail() !== me.getEmail()));
+    // Keep both the spreadsheet owner and current user as editors.
+    // This prevents the owner from being locked out when someone else runs the script.
+    const me = Session.getEffectiveUser().getEmail();
+    const owner = ss.getOwner();
+    const ownerEmail = owner ? owner.getEmail() : null;
+    const keepEmails = ownerEmail ? [me, ownerEmail] : [me];
+
+    prot.removeEditors(prot.getEditors().filter(e => !keepEmails.includes(e.getEmail())));
+    if (ownerEmail && ownerEmail !== me) {
+      prot.addEditor(ownerEmail);
+    }
 
     // Ensure domain-wide / group editors can't override
     if (prot.canDomainEdit()) {
