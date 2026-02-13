@@ -222,8 +222,12 @@ function normalizeLabel_(s) {
  * so the script can write to it regardless of who previously ran the script.
  */
 function removeExistingProtections_(sheet) {
-  sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => p.remove());
-  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => p.remove());
+  sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => {
+    try { p.remove(); } catch (e) { /* may be owned by another user */ }
+  });
+  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => {
+    try { p.remove(); } catch (e) { /* may be owned by another user */ }
+  });
 }
 
 function upsertSheet_(ss, name) {
@@ -780,11 +784,14 @@ if (last >= 1) {
  * Uses Dept_Names sheet for department names.
  */
 function updateDeptOverview_(ss) {
-  const overview = ss.getSheetByName('Dept Overview');
-  if (!overview) return;
+  const existing = ss.getSheetByName('Dept Overview');
+  if (!existing) return;
 
-  // Remove existing protections first so the script can write to this sheet
-  removeExistingProtections_(overview);
+  // Delete and recreate the sheet to bypass protections that the current user
+  // might not be able to remove (e.g. set by another user or the sheet owner).
+  const pos = existing.getIndex();
+  ss.deleteSheet(existing);
+  const overview = ss.insertSheet('Dept Overview', pos - 1);
 
   // Build dept code -> name map from Dept_Names sheet
   const deptNameSheet = ss.getSheetByName('Dept_Names');
@@ -1071,10 +1078,7 @@ if (last >= 1) {
     overview.setConditionalFormatRules(rules);
       // --- Protect Dept Overview (view-only for all non-owners/editors) ---
   {
-    // Remove old protections
-    removeExistingProtections_(overview);
-
-    // Protect entire sheet
+    // Protect entire sheet (no need to remove old protections — sheet was recreated fresh)
     const prot = overview.protect().setDescription('Dept Overview - Locked');
 
     // Keep both the spreadsheet owner and current user as editors.
