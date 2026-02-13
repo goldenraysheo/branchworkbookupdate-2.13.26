@@ -1,0 +1,1330 @@
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Reporting Tools')
+    .addItem('Process Variances', 'processRawUpload')
+    .addItem('Process Collections', 'processARReport')
+    .addToUi();
+}
+
+// --- CONFIG ---
+const RAW_SHEET = 'Variance (add report)';
+const COMMENTS_HEADER = 'Comments';
+const SALARY_ACCOUNT_SUFFIX = '-2100';
+const AUTO_ARCHIVE = true;
+
+const REQ_HEADERS = ['Account Number','Account Name','Actual','Budget']; // "$ Variance" optional
+const VARIANCE_HEADER = '$ Variance';
+
+// Labels to bold (case-insensitive)
+const BOLD_LABELS = [
+  'Revenue',
+  'Expenses',
+  'Total Revenue',
+  'Total Expenses',
+  'Change in Net Assets'
+];
+
+// Labels that should keep their numeric amounts when they're label rows
+const TOTAL_LABELS = [
+  'Total Revenue',
+  'Total Expenses',
+  'Change in Net Assets'
+];
+
+// Month maps
+const MONTH_ABBRS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+function processRawUpload() {
+  const ss = SpreadsheetApp.getActive();
+  const raw = ss.getSheetByName(RAW_SHEET);
+  if (!raw) throw new Error(`Missing sheet: ${RAW_SHEET}`);
+
+  const lastRow = raw.getLastRow();
+  const lastCol = raw.getLastColumn();
+  if (lastRow < 9) throw new Error(`${RAW_SHEET} looks empty. Paste your report at A1.`);
+
+  // e.g. "P10-Oct"
+  const periodCode = detectPeriodFromRow4_(raw);
+  if (!periodCode) throw new Error('Row 4 must contain text like "Period 10".');
+
+  // Show initial processing toast
+  ss.toast('Processing variance report...', 'Variance Report', -1);
+
+  const headerRow = findHeaderRow_(raw) || 9;
+  const header = raw.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0].map(String);
+  validateHeaders_(header, REQ_HEADERS);
+
+  const idx = indexMap_(header);
+  const hasVar = header.indexOf(VARIANCE_HEADER) !== -1;
+
+  // Pull rows after header
+  const rawRows = raw.getRange(headerRow + 1, 1, lastRow - headerRow, lastCol).getDisplayValues();
+
+  // Drop only salary rows (based on a valid code); keep all other lines (including label-only rows)
+  const cleaned = [];
+  rawRows.forEach(r => {
+    const acctCell = String(r[idx['Account Number']] || '').replace(/\u00A0/g,' ').trim();
+    if (isValidAccountCode_(acctCell) && acctCell.endsWith(SALARY_ACCOUNT_SUFFIX)) return;
+    cleaned.push(r);
+  });
+
+  // Build result rows
+  const outHeader = ['Branch','Dept','Account','Account Name','Actual','Budget',VARIANCE_HEADER,COMMENTS_HEADER];
+
+  const outRows = [];
+  cleaned.forEach(r => {
+    const acctCellRaw = String(r[idx['Account Number']] || '').replace(/\u00A0/g,' ').trim();
+    const nameRaw     = String(r[idx['Account Name']] || '').trim();
+    const colA        = String(r[0] || '').replace(/\u00A0/g,' ').trim();
+
+    const rawActual   = num_(r[idx['Actual']]);
+    const rawBudget   = num_(r[idx['Budget']]);
+    const rawVariance = hasVar ? num_(r[header.indexOf(VARIANCE_HEADER)]) : (rawActual - rawBudget);
+
+    // LABEL row: if Account Number is not a valid code, put label in Account Name (col 4)
+    if (!isValidAccountCode_(acctCellRaw)) {
+      const label = (colA || nameRaw || '').trim();
+      const keepNumbers = isTotalLabel_(label);
+      const actual   = keepNumbers ? rawActual   : '';
+      const budget   = keepNumbers ? rawBudget   : '';
+      const variance = keepNumbers ? rawVariance : '';
+      outRows.push(['', '', '', label, actual, budget, variance, '']);
+      return;
+    }
+
+    // ACCOUNT row
+    // If Actual and Budget are both zero, drop this row from the P-tab
+    if (rawActual === 0 && rawBudget === 0) {
+      return;
+    }
+
+    const parts = acctCellRaw.split('-'); // e.g. 01-03-10-0135
+    let branch  = parts[1] || '';
+    let dept    = parts[2] || '';
+    const acct  = parts[3] || '';
+
+    // Normalize branch / dept to 2 digits
+    if (branch) branch = branch.toString().padStart(2,'0');
+    if (dept)   dept   = dept.toString().padStart(2,'0');
+
+    // Force codes to text to preserve leading zeros
+    outRows.push(
+      ["'"+branch, "'"+dept, "'"+acct, nameRaw, rawActual, rawBudget, rawVariance, '']
+    );
+  });
+
+  // Write result to monthly sheet, named like "P10-Oct"
+  const monthly = upsertSheet_(ss, periodCode);
+  monthly.clear();
+
+  // Row 1: header (with instructions in Comments cell)
+  const outHeaderWithInstructions = outHeader.slice(); // copy array
+  const commentsIdx = outHeader.indexOf(COMMENTS_HEADER);
+  outHeaderWithInstructions[commentsIdx] = COMMENTS_HEADER + '\nOPTIONAL: Click Data -> Create filter view, then use filter (funnel icon) to select a specific department';
+
+  monthly.getRange(1,1,1,outHeader.length).setValues([outHeaderWithInstructions]);
+  monthly.getRange(1,1,monthly.getMaxRows(),3).setNumberFormat('@'); // keep leading zeros on code columns
+
+  // Data from row 2
+  if (outRows.length) {
+    monthly.getRange(2,1,outRows.length,outHeader.length).setValues(outRows);
+  }
+
+  // Format & protect monthly sheet
+  formatMonthlySheet_(monthly, outHeader);
+  boldLabelRows_(monthly, outHeader);
+  protectAllButComments_(monthly, outHeader);
+
+  // Show archiving toast
+  ss.toast('Archiving report data...', 'Variance Report', -1);
+
+  // Archive / reset Report Tab (archive first so overviews use full data incl 2100)
+  if (AUTO_ARCHIVE) archiveRaw_(ss, raw, periodCode);
+
+  // Show overview update toast
+  ss.toast('Updating Branch & Dept overviews...', 'Variance Report', -1);
+
+  // Update Branch & Dept overviews based on all Archive_P#-Mon sheets (includes 2100)
+  updateBranchOverview_(ss);
+  updateDeptOverview_(ss);
+
+  // Show success toast
+  ss.toast(`${periodCode} processed successfully!`, 'Variance Report Complete', 5);
+}
+
+/* ---------------- helpers ---------------- */
+
+// RETURNS "P#-Mon" (e.g. "P10-Oct")
+function detectPeriodFromRow4_(sheet) {
+  const row4 = sheet.getRange(4, 1, 1, Math.min(15, sheet.getLastColumn())).getDisplayValues()[0];
+  const joined = row4.join(' ');
+  const m = joined.match(/\bPeriod\s*([1-9]|1[0-2])\b/i);
+  if (!m) return null;
+
+  const num = Number(m[1]); // 1..12
+  const monAbbr = MONTH_ABBRS[num - 1] || '';
+  return 'P' + num + (monAbbr ? '-' + monAbbr : '');
+}
+
+function findHeaderRow_(sheet) {
+  const maxCheck = Math.min(25, sheet.getLastRow());
+  const maxCols = sheet.getLastColumn();
+  for (let r = 1; r <= maxCheck; r++) {
+    const row = sheet.getRange(r, 1, 1, maxCols).getDisplayValues()[0].map(String);
+    if (row.indexOf('Account Number') !== -1 && row.indexOf('Account Name') !== -1) return r;
+  }
+  return null;
+}
+
+function validateHeaders_(header, required) {
+  const missing = required.filter(h => header.indexOf(h) === -1);
+  if (missing.length) throw new Error('Header row missing: ' + missing.join(', ') + '\nFound: ' + header.join(' | '));
+}
+
+function indexMap_(header) { const m = {}; header.forEach((h,i)=> m[h]=i); return m; }
+
+function num_(v) {
+  if (v === '' || v === null || v === undefined) return 0;
+  const s = String(v).replace(/\$/g,'').replace(/,/g,'').trim();
+  const n = Number(s);
+  return isNaN(n) ? 0 : n;
+}
+
+// Treat only strict 2-2-2-4 digit codes as valid (e.g., 01-03-10-0135).
+function isValidAccountCode_(s) {
+  if (!s) return false;
+  const clean = String(s).replace(/\u00A0/g, ' ').trim();
+  return /^\d{2}-\d{2}-\d{2}-\d{4}$/.test(clean);
+}
+
+function isTotalLabel_(label) {
+  const t = normalizeLabel_(label);
+  return TOTAL_LABELS.map(normalizeLabel_).includes(t);
+}
+
+function isBoldLabel_(label) {
+  const t = normalizeLabel_(label);
+  return BOLD_LABELS.map(normalizeLabel_).includes(t);
+}
+
+function normalizeLabel_(s) {
+  return String(s || '')
+    .replace(/\u00A0/g,' ')
+    .replace(/[^\w\s]/g,'')
+    .trim()
+    .toLowerCase();
+}
+
+function upsertSheet_(ss, name) {
+  const existingSheet = ss.getSheetByName(name);
+  if (existingSheet) return existingSheet;
+
+  // Find leftmost existing P-tab, or fall back to Variance tab
+  const allSheets = ss.getSheets();
+  let targetIndex = null;
+
+  // Find the leftmost P-tab (e.g., P1-Jan, P2-Feb, etc.)
+  for (let i = 0; i < allSheets.length; i++) {
+    const sheetName = allSheets[i].getName();
+    if (/^P\d{1,2}-/.test(sheetName)) {
+      targetIndex = i; // Found leftmost P-tab, insert here
+      break;
+    }
+  }
+
+  // If no P-tabs found, insert to the left of Variance tab
+  if (targetIndex === null) {
+    const varianceSheet = ss.getSheetByName(RAW_SHEET);
+    if (varianceSheet) {
+      targetIndex = varianceSheet.getIndex() - 1;
+    }
+  }
+
+  // Insert at target index, or at end as fallback
+  if (targetIndex !== null) {
+    return ss.insertSheet(name, targetIndex);
+  }
+  return ss.insertSheet(name);
+}
+
+/**
+ * Formatting for P-tab monthly sheet
+ * - Row 1: header (with instructions in Comments cell)
+ * - Row 2+: data
+ */
+function formatMonthlySheet_(sheet, outHeader) {
+  // Hide gridlines (borders are visible via setBorder)
+  sheet.setHiddenGridlines(true);
+
+  // Freeze header row
+  sheet.setFrozenRows(1);
+
+  // Remove existing filter, then create one starting at row 1 (header row)
+  const existingFilter = sheet.getFilter();
+  if (existingFilter) existingFilter.remove();
+
+  // DEFINE VARIABLES FIRST
+  const lastRow = sheet.getLastRow();
+  const lastCol = outHeader.length;
+
+  // NOW create filter using those variables
+  if (lastRow >= 1) {
+    sheet.getRange(1, 1, lastRow, lastCol).createFilter();
+  }
+
+  // Make everything Verdana size 9
+  sheet.getDataRange().setFontFamily("Verdana").setFontSize(9);
+
+  // Header row bold and wrapped
+  sheet.getRange(1,1,1,outHeader.length).setFontWeight('bold').setWrap(true);
+
+  if (lastRow >= 2) {
+    const firstDataRow = 2;
+    const actualCol    = outHeader.indexOf('Actual')+1;        // E
+    const budgetCol    = outHeader.indexOf('Budget')+1;        // F
+    const varianceCol  = outHeader.indexOf(VARIANCE_HEADER)+1; // G
+
+    const money = '$#,##0.00';
+    sheet.getRange(firstDataRow, actualCol, lastRow-firstDataRow+1, 1).setNumberFormat(money);
+    sheet.getRange(firstDataRow, budgetCol, lastRow-firstDataRow+1, 1).setNumberFormat(money);
+    sheet.getRange(firstDataRow, varianceCol, lastRow-firstDataRow+1, 1).setNumberFormat(money);
+
+    // Conditional formatting rules
+    const rules = [];
+
+    // 1) Variance-only CF (±$500)
+    const varRange = sheet.getRange(firstDataRow, varianceCol, lastRow-firstDataRow+1, 1);
+    const varColLetter = colToLetter_(varianceCol);
+
+    const posRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${varColLetter}${firstDataRow}>=500`)
+      .setFontColor('#1a7f37')
+      .setBackground('#e6f4ea')
+      .setBold(true)
+      .setRanges([varRange]).build();
+
+    const negRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${varColLetter}${firstDataRow}<=-500`)
+      .setFontColor('#a61b1b')
+      .setBackground('#fde8e8')
+      .setBold(true)
+      .setRanges([varRange]).build();
+
+    rules.push(posRule, negRule);
+
+    // 2) Highlight Actual + Budget when Actual ≠ 0 and Budget = 0
+    const actualColLetter = colToLetter_(actualCol);
+    const budgetColLetter = colToLetter_(budgetCol);
+    const abRange = sheet.getRange(firstDataRow, actualCol, lastRow-firstDataRow+1, 2); // Actual + Budget
+
+    const noBudgetRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(
+        `=AND($${actualColLetter}${firstDataRow}<>0,$${budgetColLetter}${firstDataRow}=0)`
+      )
+      .setBackground('#fff3cd') // soft yellow
+      .setRanges([abRange])
+      .build();
+
+    rules.push(noBudgetRule);
+
+    sheet.setConditionalFormatRules(rules);
+  }
+
+  // Let Sheets auto-fit all columns so Account Name has room
+  sheet.autoResizeColumns(1, outHeader.length);
+
+  // Explicitly auto-resize numeric columns (E, F, G) and add a little padding
+  const actualCol    = outHeader.indexOf('Actual')+1;
+  const budgetCol    = outHeader.indexOf('Budget')+1;
+  const varianceCol  = outHeader.indexOf(VARIANCE_HEADER)+1;
+  [actualCol, budgetCol, varianceCol].forEach(col => {
+    sheet.autoResizeColumn(col);
+    const w = sheet.getColumnWidth(col);
+    sheet.setColumnWidth(col, w + 30); // increased padding for variance column
+  });
+
+  // Comments column: wrap + wide
+  const commentsCol = outHeader.indexOf(COMMENTS_HEADER)+1;
+  sheet.getRange(1, commentsCol, sheet.getMaxRows()).setWrap(true);
+  sheet.setColumnWidth(commentsCol, 500);
+
+  // Branch/Dept/Account columns - set individual widths
+  const branchCol = 1;
+  const deptCol = 2;
+  const accountCol = 3;
+  sheet.setColumnWidth(branchCol, 85);   // Column A (Branch) - wider
+  sheet.setColumnWidth(deptCol, 70);     // Column B (Dept) - standard
+  sheet.setColumnWidth(accountCol, 85);  // Column C (Account) - wider
+
+  // Add light dotted borders between all cells (from row 1 onwards, all columns)
+  if (lastRow >= 1) {
+    sheet.getRange(1, 1, lastRow, lastCol).setBorder(
+      true,                                     // top ON
+      true,                                     // left ON
+      true,                                     // bottom ON
+      true,                                     // right ON
+      true,                                     // vertical ON
+      true,                                     // horizontal ON
+      '#cccccc',                                // light gray
+      SpreadsheetApp.BorderStyle.DOTTED         // dotted style
+    );
+  }
+
+  // Apply rich text formatting to Comments header (must be AFTER bold formatting)
+  // commentsCol already declared above
+  const commentsText = SpreadsheetApp.newRichTextValue()
+    .setText(COMMENTS_HEADER + '\nOPTIONAL: Click Data -> Create filter view, then use filter (funnel icon) to select a specific department')
+    .setTextStyle(0, COMMENTS_HEADER.length, SpreadsheetApp.newTextStyle().setBold(true).build())
+    .setTextStyle(COMMENTS_HEADER.length + 1, COMMENTS_HEADER.length + 1 + 'OPTIONAL: Click Data -> Create filter view, then use filter (funnel icon) to select a specific department'.length, SpreadsheetApp.newTextStyle().setBold(false).setItalic(true).build())
+    .build();
+  sheet.getRange(1, commentsCol).setRichTextValue(commentsText);
+}
+
+// Make target labels bold across the whole row
+function boldLabelRows_(sheet, outHeader) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const nameCol = outHeader.indexOf('Account Name') + 1;
+  const firstDataRow = 2;
+  const range   = sheet.getRange(firstDataRow, nameCol, lastRow - firstDataRow + 1, 1);
+  const values  = range.getDisplayValues().map(r => String(r[0] || '').trim());
+
+  const rowsToBold = [];
+  values.forEach((label, i) => {
+    if (isBoldLabel_(label)) rowsToBold.push(firstDataRow + i);
+  });
+
+  if (rowsToBold.length) {
+    const totalCols = outHeader.length;
+    const a1s = rowsToBold.map(r => sheet.getRange(r, 1, 1, totalCols).getA1Notation());
+    sheet.getRangeList(a1s).setFontWeight('bold');
+  }
+}
+
+/**
+ * Protect P-tab so only Comments column (rows 2+) is editable by normal editors.
+ * - Entire sheet is protected
+ * - Column "Comments" (from row 2 down) is unprotected
+ * - Only the script owner remains as an allowed editor for the protection
+ */
+function protectAllButComments_(sheet, outHeader) {
+  const commentsCol = outHeader.indexOf(COMMENTS_HEADER)+1;
+  if (commentsCol <= 0) return; // safety
+
+  // Remove all existing protections on this sheet
+  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => p.remove());
+  sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => p.remove());
+
+  // Protect the whole sheet
+  const prot = sheet.protect().setDescription('Lock all but Comments');
+  prot.setWarningOnly(false);
+
+  // Allow editing ONLY in the Comments column (from row 2 down)
+  const editableRange = sheet.getRange(
+    2,
+    commentsCol,
+    Math.max(1, sheet.getMaxRows() - 1),
+    1
+  );
+  prot.setUnprotectedRanges([editableRange]);
+
+  // Restrict who can bypass this protection: remove all editors except the script owner.
+  const me = Session.getEffectiveUser().getEmail();
+  const editors = prot.getEditors();
+  const toRemove = editors.filter(u => u.getEmail && u.getEmail() !== me);
+  if (toRemove.length) {
+    prot.removeEditors(toRemove);
+  }
+
+  prot.setDomainEdit(false);
+  // If you want another super-editor, add them here:
+  // prot.addEditor('finance@yourorg.org');
+}
+
+/**
+ * Build/refresh Branch Overview from all Archive_P#-Mon sheets.
+ * Uses ARCHIVE sheets, so 2100 is INCLUDED in the totals.
+ */
+function updateBranchOverview_(ss) {
+  const overview = ss.getSheetByName('Branch Overview');
+  if (!overview) return;
+
+  const execSummaryCol = 15; // column O
+
+  // ---- 1. Capture existing Executive Summary notes ----
+  const lastRow = overview.getLastRow();
+  const summaryMap = {}; // key: branch|monthName -> note
+
+  if (lastRow > 1) {
+    const existing = overview.getRange(2, 1, lastRow - 1, execSummaryCol).getDisplayValues();
+    existing.forEach(row => {
+      const branch = String(row[0] || '').trim();
+      const month  = String(row[1] || '').trim();
+      const note   = String(row[execSummaryCol - 1] || '').trim();
+      if (branch && month && note) {
+        summaryMap[branch + '|' + month] = note;
+      }
+    });
+  }
+
+  // ---- 2. Scan all Archive_P#-Mon sheets ----
+  const overviewMap = {}; // key: branch|period -> data object
+
+  ss.getSheets().forEach(sh => {
+    const name = sh.getName();
+    const m = /^Archive_P(\d{1,2})-/.exec(name);
+    if (!m) return;
+
+    const period = Number(m[1]); // 1..12
+    if (period < 1 || period > 12) return;
+    const monthName = MONTH_NAMES[period - 1];
+
+    const sheet = sh;
+    const headerRow = findHeaderRow_(sheet);
+    if (!headerRow) return;
+
+    const dataLastRow = sheet.getLastRow();
+    const dataLastCol = sheet.getLastColumn();
+    if (dataLastRow <= headerRow) return;
+
+    const header = sheet.getRange(headerRow,1,1,dataLastCol).getDisplayValues()[0];
+    const idx = indexMap_(header);
+    if (idx['Account Number'] === undefined ||
+        idx['Account Name'] === undefined ||
+        idx['Actual'] === undefined ||
+        idx['Budget'] === undefined) return;
+
+    const allValues = sheet.getRange(headerRow + 1, 1, dataLastRow - headerRow, dataLastCol).getDisplayValues();
+
+    // find label rows (Revenue / Total Revenue / Expenses / Total Expenses)
+    let rowRevenue = null, rowTotalRevenue = null, rowExpenses = null, rowTotalExpenses = null;
+    allValues.forEach((r, i) => {
+      const labelA   = String(r[0] || '').trim();                     // column A
+      const labelNam = String(r[idx['Account Name']] || '').trim();   // backup
+      const label    = labelA || labelNam;
+      const norm     = normalizeLabel_(label);
+      const sheetRow = headerRow + 1 + i;
+
+      if (norm === normalizeLabel_('Revenue') && rowRevenue === null) rowRevenue = sheetRow;
+      if (norm === normalizeLabel_('Total Revenue') && rowTotalRevenue === null) rowTotalRevenue = sheetRow;
+      if (norm === normalizeLabel_('Expenses') && rowExpenses === null) rowExpenses = sheetRow;
+      if (norm === normalizeLabel_('Total Expenses') && rowTotalExpenses === null) rowTotalExpenses = sheetRow;
+    });
+
+    if (rowRevenue === null || rowTotalRevenue === null || rowExpenses === null || rowTotalExpenses === null) {
+      return; // malformed, skip
+    }
+
+    const revenueStart  = rowRevenue + 1;
+    const revenueEnd    = rowTotalRevenue - 1;
+    const expensesStart = rowExpenses + 1;
+    const expensesEnd   = rowTotalExpenses - 1;
+
+    function addTotals(branch, period, monthName, type, act, bud) {
+      const key = branch + '|' + period;
+      if (!overviewMap[key]) {
+        overviewMap[key] = {
+          branch: branch,
+          period: period,
+          monthName: monthName,
+          revAct: 0,
+          revPlan: 0,
+          expAct: 0,
+          expPlan: 0
+        };
+      }
+      const obj = overviewMap[key];
+      if (type === 'rev') {
+        obj.revAct  += act;
+        obj.revPlan += bud;
+      } else {
+        obj.expAct  += act;
+        obj.expPlan += bud;
+      }
+    }
+
+    // loop rows and accumulate (INCLUDES 2100)
+    allValues.forEach((r, i) => {
+      const sheetRow = headerRow + 1 + i;
+      const acctNum = String(r[idx['Account Number']] || '').replace(/\u00A0/g,' ').trim();
+      if (!isValidAccountCode_(acctNum)) return;
+
+      const parts = acctNum.split('-');
+      let branch = parts[1] || '';
+      if (!branch) return;
+      branch = branch.toString().padStart(2,'0'); // always 2-digit branch
+
+      const act = num_(r[idx['Actual']]);
+      const bud = num_(r[idx['Budget']]);
+
+      if (sheetRow >= revenueStart && sheetRow <= revenueEnd) {
+        addTotals(branch, period, monthName, 'rev', act, bud);
+      } else if (sheetRow >= expensesStart && sheetRow <= expensesEnd) {
+        addTotals(branch, period, monthName, 'exp', act, bud);
+      }
+    });
+  });
+
+  // ---- 3. Convert to sorted array and compute Net + YTD ----
+  const rows = Object.values(overviewMap);
+  const lastRow2 = overview.getLastRow();
+
+  if (!rows.length) {
+    if (lastRow2 > 1) {
+      overview.getRange(2,1,lastRow2-1,overview.getLastColumn()).clearContent();
+    }
+    return;
+  }
+
+  rows.sort((a,b) => {
+    if (a.period === b.period) return a.branch.localeCompare(b.branch);
+    return a.period - b.period;
+  });
+
+  const branchYTD = {}; // branch -> {act, plan}
+
+  rows.forEach(r => {
+    const netAct  = r.revAct - r.expAct;
+    const netPlan = r.revPlan - r.expPlan;
+    const netVar  = netAct - netPlan;
+    const revVar  = r.revAct - r.revPlan;
+    const expVar  = r.expAct - r.expPlan;
+
+    if (!branchYTD[r.branch]) branchYTD[r.branch] = {act:0, plan:0};
+    branchYTD[r.branch].act  += netAct;
+    branchYTD[r.branch].plan += netPlan;
+
+    const ytdAct  = branchYTD[r.branch].act;
+    const ytdPlan = branchYTD[r.branch].plan;
+    const ytdVar  = ytdAct - ytdPlan;
+
+    r.revVar = revVar;
+    r.expVar = expVar;
+    r.netAct = netAct;
+    r.netPlan = netPlan;
+    r.netVar = netVar;
+    r.ytdAct = ytdAct;
+    r.ytdPlan = ytdPlan;
+    r.ytdVar = ytdVar;
+  });
+
+  // ---- 4. Clear old data rows (except header) ----
+  if (lastRow2 > 1) {
+    overview.getRange(2,1,lastRow2-1,overview.getLastColumn()).clearContent();
+  }
+
+  // ---- 5. Write new rows, restoring Executive Summary where possible ----
+  const out = rows.map(r => {
+    const monthName = r.monthName || MONTH_NAMES[r.period - 1] || '';
+    const key = r.branch + '|' + monthName;
+    const note = summaryMap[key] || '';
+
+    const branchDisplay = "'" + r.branch.toString().padStart(2,'0'); // ALWAYS 2-digit text
+
+    return [
+      branchDisplay,
+      monthName,
+      r.revAct,
+      r.revPlan,
+      r.revVar,
+      r.expAct,
+      r.expPlan,
+      r.expVar,
+      r.netAct,
+      r.netPlan,
+      r.netVar,
+      r.ytdAct,
+      r.ytdPlan,
+      r.ytdVar,
+      note
+    ];
+  });
+
+  overview.getRange(2,1,out.length,out[0].length).setValues(out);
+
+  // Basic formatting
+  overview.setFrozenRows(1);
+  overview.getDataRange().setFontFamily('Verdana').setFontSize(9);
+  overview.getRange(1,1,1,overview.getLastColumn()).setFontWeight('bold');
+  // NEW: wrap header row text
+overview.getRange(1,1,1,overview.getLastColumn()).setWrap(true);
+
+  // Remove existing filter then create a fresh one
+  const existingFilter = overview.getFilter();
+  if (existingFilter) existingFilter.remove();
+  const last = overview.getLastRow();
+  const lastCol = overview.getLastColumn();
+  if (last >= 1) {
+    overview.getRange(1,1,last,lastCol).createFilter();
+  }
+
+  if (last >= 2) {
+    // Branch column A as text
+    overview.getRange(2,1,last-1,1).setNumberFormat('@');
+
+    // numeric columns C through N (3..14)
+    const moneyRange = overview.getRange(2,3,last-1,12);
+    moneyRange.setNumberFormat('$#,##0.00');
+  }
+  // --- Thick group separators in header & column (after Month, Rev, Exp, Net, YTD) ---
+if (last >= 1) {
+  // Columns: B, E, H, K, N  → 2,5,8,11,14
+  const borderCols = [2, 5, 8, 11, 14];
+  borderCols.forEach(col => {
+    if (col > lastCol) return;
+    overview.getRange(1, col, last, 1).setBorder(
+      null,                                   // top
+      null,                                   // left
+      null,                                   // bottom
+      true,                                   // right border ON
+      null,                                   // vertical
+      null,                                   // horizontal
+      null,                                   // default color
+      SpreadsheetApp.BorderStyle.SOLID_THICK  // heavy line
+    );
+  });
+}
+
+  // Conditional formatting for variance columns
+  if (last >= 2) {
+    const rules = [];
+    const varCols = [5, 8, 11, 14]; // E, H, K, N
+
+    varCols.forEach(col => {
+      const r = overview.getRange(2, col, last-1, 1);
+
+      if (col === 8) {
+        // Expense variance: negative is good (underspend)
+        rules.push(
+          SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberLessThan(0)
+            .setFontColor('#1a7f37')
+            .setBackground('#e6f4ea')
+            .setRanges([r])
+            .build()
+        );
+        rules.push(
+          SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberGreaterThan(0)
+            .setFontColor('#a61b1b')
+            .setBackground('#fde8e8')
+            .setRanges([r])
+            .build()
+        );
+      } else {
+        // Revenue / Net / YTD variance: positive good, negative bad
+        rules.push(
+          SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberGreaterThan(0)
+            .setFontColor('#1a7f37')
+            .setBackground('#e6f4ea')
+            .setRanges([r])
+            .build()
+        );
+        rules.push(
+          SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberLessThan(0)
+            .setFontColor('#a61b1b')
+            .setBackground('#fde8e8')
+            .setRanges([r])
+            .build()
+        );
+      }
+    });
+
+    overview.setConditionalFormatRules(rules);
+  }
+
+  // Wrap Executive Summary and widen
+  overview.getRange(1,execSummaryCol,last).setWrap(true);
+  overview.setColumnWidth(execSummaryCol, 400);
+
+  // Add light dotted borders between rows in Branch, Month, and Executive Summary columns
+  if (last >= 2) {
+    const dottedBorderCols = [1, 2, execSummaryCol]; // A, B, O
+    dottedBorderCols.forEach(col => {
+      overview.getRange(2, col, last-1, 1).setBorder(
+        null,                                    // top
+        null,                                    // left
+        true,                                    // bottom ON
+        null,                                    // right
+        null,                                    // vertical
+        true,                                    // horizontal ON
+        '#cccccc',                               // light gray
+        SpreadsheetApp.BorderStyle.DOTTED        // dotted style
+      );
+    });
+  }
+}
+
+/**
+ * NEW: Dept Overview built from all Archive_P#-Mon sheets.
+ * Uses Dept_Names sheet for department names.
+ */
+function updateDeptOverview_(ss) {
+  const overview = ss.getSheetByName('Dept Overview');
+  if (!overview) return;
+
+  // Build dept code -> name map from Dept_Names sheet
+  const deptNameSheet = ss.getSheetByName('Dept_Names');
+  const deptNameMap = {};
+  if (deptNameSheet) {
+    const lr = deptNameSheet.getLastRow();
+    if (lr >= 1) {
+      const vals = deptNameSheet.getRange(1,1,lr,2).getDisplayValues();
+      vals.forEach(row => {
+        const codeRaw = String(row[0] || '').trim();
+        if (!codeRaw) return;
+        const code = codeRaw.padStart(2,'0');
+        const name = String(row[1] || '').trim();
+        deptNameMap[code] = name;
+      });
+    }
+  }
+
+  const header = [
+    'Branch','Dept','Dept Name','Month',
+    'Revenue (actual)','Revenue (plan)','Revenue variance',
+    'Expenses (actual)','Expenses (plan)','Expenses variance',
+    'Net (actual)','Net (plan)','Net variance',
+    'YTD Net (actual)','YTD Net (plan)','YTD Net variance'
+  ];
+
+  const overviewMap = {}; // key: branch|dept|period -> agg object
+
+  ss.getSheets().forEach(sh => {
+    const name = sh.getName();
+    const m = /^Archive_P(\d{1,2})-/.exec(name);
+    if (!m) return;
+
+    const period = Number(m[1]); // 1..12
+    if (period < 1 || period > 12) return;
+    const monthName = MONTH_NAMES[period - 1];
+
+    const sheet = sh;
+    const headerRow = findHeaderRow_(sheet);
+    if (!headerRow) return;
+
+    const dataLastRow = sheet.getLastRow();
+    const dataLastCol = sheet.getLastColumn();
+    if (dataLastRow <= headerRow) return;
+
+    const rawHeader = sheet.getRange(headerRow,1,1,dataLastCol).getDisplayValues()[0];
+    const idx = indexMap_(rawHeader);
+    if (idx['Account Number'] === undefined ||
+        idx['Account Name'] === undefined ||
+        idx['Actual'] === undefined ||
+        idx['Budget'] === undefined) return;
+
+    const allValues = sheet.getRange(headerRow + 1, 1, dataLastRow - headerRow, dataLastCol).getDisplayValues();
+
+    // find label rows (Revenue / Total Revenue / Expenses / Total Expenses)
+    let rowRevenue = null, rowTotalRevenue = null, rowExpenses = null, rowTotalExpenses = null;
+    allValues.forEach((r, i) => {
+      const labelA   = String(r[0] || '').trim();                     // column A
+      const labelNam = String(r[idx['Account Name']] || '').trim();   // backup
+      const label    = labelA || labelNam;
+      const norm     = normalizeLabel_(label);
+      const sheetRow = headerRow + 1 + i;
+
+      if (norm === normalizeLabel_('Revenue') && rowRevenue === null) rowRevenue = sheetRow;
+      if (norm === normalizeLabel_('Total Revenue') && rowTotalRevenue === null) rowTotalRevenue = sheetRow;
+      if (norm === normalizeLabel_('Expenses') && rowExpenses === null) rowExpenses = sheetRow;
+      if (norm === normalizeLabel_('Total Expenses') && rowTotalExpenses === null) rowTotalExpenses = sheetRow;
+    });
+
+    if (rowRevenue === null || rowTotalRevenue === null || rowExpenses === null || rowTotalExpenses === null) {
+      return; // malformed, skip
+    }
+
+    const revenueStart  = rowRevenue + 1;
+    const revenueEnd    = rowTotalRevenue - 1;
+    const expensesStart = rowExpenses + 1;
+    const expensesEnd   = rowTotalExpenses - 1;
+
+    function addTotals(branch, dept, period, monthName, type, act, bud) {
+      const key = branch + '|' + dept + '|' + period;
+      if (!overviewMap[key]) {
+        overviewMap[key] = {
+          branch: branch,
+          dept: dept,
+          period: period,
+          monthName: monthName,
+          revAct: 0,
+          revPlan: 0,
+          expAct: 0,
+          expPlan: 0
+        };
+      }
+      const obj = overviewMap[key];
+      if (type === 'rev') {
+        obj.revAct  += act;
+        obj.revPlan += bud;
+      } else {
+        obj.expAct  += act;
+        obj.expPlan += bud;
+      }
+    }
+
+    // loop rows and accumulate (INCLUDES 2100)
+    allValues.forEach((r, i) => {
+      const sheetRow = headerRow + 1 + i;
+      const acctNum = String(r[idx['Account Number']] || '').replace(/\u00A0/g,' ').trim();
+      if (!isValidAccountCode_(acctNum)) return;
+
+      const parts = acctNum.split('-');
+      let branch = parts[1] || '';
+      let dept   = parts[2] || '';
+      if (!branch || !dept) return;
+      branch = branch.toString().padStart(2,'0');
+      dept   = dept.toString().padStart(2,'0');
+
+      const act = num_(r[idx['Actual']]);
+      const bud = num_(r[idx['Budget']]);
+
+      if (sheetRow >= revenueStart && sheetRow <= revenueEnd) {
+        addTotals(branch, dept, period, monthName, 'rev', act, bud);
+      } else if (sheetRow >= expensesStart && sheetRow <= expensesEnd) {
+        addTotals(branch, dept, period, monthName, 'exp', act, bud);
+      }
+    });
+  });
+
+  // ---- Build sorted rows and compute Net + YTD by (branch, dept) ----
+  const rows = Object.values(overviewMap);
+  if (!rows.length) {
+    overview.clear();
+    overview.getRange(1,1,1,header.length).setValues([header]);
+    return;
+  }
+
+  // sort by Branch, then Dept, then Period
+  rows.sort((a,b) => {
+    if (a.branch !== b.branch) return a.branch.localeCompare(b.branch);
+    if (a.dept !== b.dept) return a.dept.localeCompare(b.dept);
+    return a.period - b.period;
+  });
+
+  const ytd = {}; // key branch|dept -> {act, plan}
+
+  const out = rows.map(r => {
+    const keyBD = r.branch + '|' + r.dept;
+    const netAct  = r.revAct - r.expAct;
+    const netPlan = r.revPlan - r.expPlan;
+    const netVar  = netAct - netPlan;
+    const revVar  = r.revAct - r.revPlan;
+    const expVar  = r.expAct - r.expPlan;
+
+    if (!ytd[keyBD]) ytd[keyBD] = {act:0, plan:0};
+    ytd[keyBD].act  += netAct;
+    ytd[keyBD].plan += netPlan;
+
+    const ytdAct  = ytd[keyBD].act;
+    const ytdPlan = ytd[keyBD].plan;
+    const ytdVar  = ytdAct - ytdPlan;
+
+    const branchDisplay = "'" + r.branch.toString().padStart(2,'0');
+    const deptCode      = r.dept.toString().padStart(2,'0');
+    const deptDisplay   = "'" + deptCode;
+    const deptName      = deptNameMap[deptCode] || '';
+    const monthName     = r.monthName || MONTH_NAMES[r.period - 1] || '';
+
+    return [
+      branchDisplay,
+      deptDisplay,
+      deptName,
+      monthName,
+      r.revAct,
+      r.revPlan,
+      revVar,
+      r.expAct,
+      r.expPlan,
+      expVar,
+      netAct,
+      netPlan,
+      netVar,
+      ytdAct,
+      ytdPlan,
+      ytdVar
+    ];
+  });
+
+  // ---- Write to Dept Overview ----
+  overview.clear();
+  overview.getRange(1,1,1,header.length).setValues([header]);
+  overview.getRange(2,1,out.length,header.length).setValues(out);
+
+  // Formatting
+  overview.setFrozenRows(1);
+  overview.getDataRange().setFontFamily('Verdana').setFontSize(9);
+  overview.getRange(1,1,1,header.length).setFontWeight('bold');
+  // Formatting
+overview.setFrozenRows(1);
+overview.getDataRange().setFontFamily('Verdana').setFontSize(9);
+overview.getRange(1,1,1,header.length).setFontWeight('bold');
+// NEW: wrap header row text
+overview.getRange(1,1,1,header.length).setWrap(true);
+
+  const existingFilter = overview.getFilter();
+  if (existingFilter) existingFilter.remove();
+  const last = overview.getLastRow();
+  const lastCol = overview.getLastColumn();
+  if (last >= 1) {
+    overview.getRange(1,1,last,lastCol).createFilter();
+  }
+
+  if (last >= 2) {
+    // Branch + Dept as text
+    overview.getRange(2,1,last-1,2).setNumberFormat('@');
+
+    // numeric columns E..P (5..16)
+    const moneyRange = overview.getRange(2,5,last-1,12);
+    moneyRange.setNumberFormat('$#,##0.00');
+  }
+  // --- Thick group separators in header & column (after Month, Rev, Exp, Net, YTD) ---
+if (last >= 1) {
+  // Columns: D, G, J, M, P  → 4,7,10,13,16
+  const borderCols = [4, 7, 10, 13, 16];
+  borderCols.forEach(col => {
+    if (col > lastCol) return;
+    overview.getRange(1, col, last, 1).setBorder(
+      null,                                   // top
+      null,                                   // left
+      null,                                   // bottom
+      true,                                   // right border ON
+      null,                                   // vertical
+      null,                                   // horizontal
+      null,                                   // default color
+      SpreadsheetApp.BorderStyle.SOLID_THICK  // heavy line
+    );
+  });
+}
+
+  // Conditional formatting for variance columns: G, J, M, P (7,10,13,16)
+  if (last >= 2) {
+    const rules = [];
+    const varCols = [7, 10, 13, 16];
+
+    varCols.forEach(col => {
+      const r = overview.getRange(2, col, last-1, 1);
+
+      if (col === 10) {
+        // Expense variance: negative is good
+        rules.push(
+          SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberLessThan(0)
+            .setFontColor('#1a7f37')
+            .setBackground('#e6f4ea')
+            .setRanges([r])
+            .build()
+        );
+        rules.push(
+          SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberGreaterThan(0)
+            .setFontColor('#a61b1b')
+            .setBackground('#fde8e8')
+            .setRanges([r])
+            .build()
+        );
+      } else {
+        // Revenue / Net / YTD variance: positive good
+        rules.push(
+          SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberGreaterThan(0)
+            .setFontColor('#1a7f37')
+            .setBackground('#e6f4ea')
+            .setRanges([r])
+            .build()
+        );
+        rules.push(
+          SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberLessThan(0)
+            .setFontColor('#a61b1b')
+            .setBackground('#fde8e8')
+            .setRanges([r])
+            .build()
+        );
+      }
+    });
+
+    overview.setConditionalFormatRules(rules);
+      // --- Protect Dept Overview (view-only for all non-owners/editors) ---
+  {
+    // Remove old protections
+    overview.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => p.remove());
+    overview.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => p.remove());
+
+    // Protect entire sheet
+    const prot = overview.protect().setDescription('Dept Overview - Locked');
+
+    // Remove domain editors so only the script owner retains full rights
+    const me = Session.getEffectiveUser();
+    prot.removeEditors(prot.getEditors().filter(e => e.getEmail() !== me.getEmail()));
+
+    // Ensure domain-wide / group editors can't override
+    if (prot.canDomainEdit()) {
+      prot.setDomainEdit(false);
+    }
+  }
+
+  }
+}
+
+function archiveRaw_(ss, raw, periodCode) {
+  const archiveName = 'Archive_' + periodCode;
+  const archive = upsertSheet_(ss, archiveName);
+  archive.clear();
+  const rng = raw.getDataRange();
+  archive.getRange(1,1,rng.getNumRows(), rng.getNumColumns()).setValues(rng.getValues());
+  archive.hideSheet();
+
+  // Clear the Report Tab and rewrite instructions
+  raw.clear();
+  writeInstructions_(raw);
+}
+
+// Instructions on "Variance (add report)" — Verdana 10, bullets
+function writeInstructions_(sheet) {
+  const lines = [
+    '• Pull a Statement of Activities report for the month you are reporting on.',
+    '• Copy the entire report by clicking in the upper left corner and copying.',
+    '• On this page, click on cell A1 and paste the report.',
+    '• Click "Process Variance Report" button.',
+    '• A new tab will be created for you to complete your reporting!'
+  ];
+
+  const range = sheet.getRange(2, 10, lines.length, 1);
+  range.setValues(lines.map(t => [t]));
+  range.setFontFamily('Verdana');
+  range.setFontSize(10);
+
+  // Add "Paste here" indicator at A1 with soft yellow highlight
+  sheet.getRange('A1').setValue('Paste here')
+    .setBackground('#FFFACD')
+    .setFontWeight('bold')
+    .setFontFamily('Verdana')
+    .setFontSize(10);
+}
+
+function colToLetter_(col){
+  let t='';
+  while(col>0){
+    let r=(col-1)%26;
+    t=String.fromCharCode(65+r)+t;
+    col=Math.floor((col-1)/26);
+  }
+  return t;
+}
+
+/* ====================================================================
+   AR REPORT PROCESSING
+   ==================================================================== */
+
+function processARReport() {
+  const ss = SpreadsheetApp.getActive();
+  const arSheet = ss.getSheetByName('ARs (add report)');
+
+  // Find sheet ending with "Weekly KPIs" (e.g., "01 Weekly KPIs", "02 Weekly KPIs")
+  const allSheets = ss.getSheets();
+  const kpiSheet = allSheets.find(sheet => sheet.getName().endsWith(' Weekly KPIs'));
+
+  if (!arSheet) throw new Error('Missing sheet: ARs (add report)');
+  if (!kpiSheet) throw new Error('Missing sheet ending with " Weekly KPIs"');
+
+  // 1. Get week number from B1
+  const weekNum = arSheet.getRange('B1').getValue();
+  if (!weekNum) throw new Error('Please enter a Week Number in cell B1');
+
+  // Show initial processing toast
+  ss.toast('Processing AR report...', 'AR Report', -1);
+
+  // 2. Find header row (starting from row 11)
+  const lastRow = arSheet.getLastRow();
+  const lastCol = arSheet.getLastColumn();
+  if (lastRow < 11) throw new Error('No data found. Please paste report starting at A11');
+
+  let headerRow = null;
+  for (let r = 11; r <= Math.min(25, lastRow); r++) {
+    const row = arSheet.getRange(r, 1, 1, lastCol).getDisplayValues()[0];
+    if (row.indexOf('Membership Status') !== -1) {
+      headerRow = r;
+      break;
+    }
+  }
+
+  if (!headerRow) throw new Error('Could not find header row with "Membership Status"');
+
+  // Get header and find column indices
+  const header = arSheet.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0];
+
+  const requiredCols = {
+    'Membership Status': header.indexOf('Membership Status') + 1,
+    '0 - 30 Days': header.indexOf('0 - 30 Days') + 1,
+    '31 - 60 Days': header.indexOf('31 - 60 Days') + 1,
+    '61 - 90 Days': header.indexOf('61 - 90 Days') + 1,
+    '91 - 120 Days': header.indexOf('91 - 120 Days') + 1,
+    'Over 120 Days': header.indexOf('Over 120 Days') + 1,
+    'Total': header.indexOf('Total') + 1
+  };
+
+  // Check for missing columns
+  const missing = Object.keys(requiredCols).filter(col => !requiredCols[col] || requiredCols[col] === 0);
+  if (missing.length) {
+    throw new Error('Missing required columns: ' + missing.join(', '));
+  }
+
+  const colStatus = requiredCols['Membership Status'];
+  const col0to30 = requiredCols['0 - 30 Days'];
+  const col31to60 = requiredCols['31 - 60 Days'];
+  const col61to90 = requiredCols['61 - 90 Days'];
+  const col91to120 = requiredCols['91 - 120 Days'];
+  const col120plus = requiredCols['Over 120 Days'];
+  const colTotal = requiredCols['Total'];
+
+  // 3. Read data and skip "Organization" rows (don't delete)
+  const dataStartRow = headerRow + 1;
+  const dataRows = arSheet.getRange(dataStartRow, 1, lastRow - headerRow, lastCol).getDisplayValues();
+
+  // Build clean data array by skipping "Organization" rows AND the last row (totals)
+  const cleanData = [];
+  const rowsToProcess = dataRows.slice(0, -1); // Skip last row (totals)
+
+  rowsToProcess.forEach(row => {
+    const status = String(row[colStatus - 1] || '').trim();
+    if (status !== 'Organization') {
+      cleanData.push(row);
+    }
+  });
+
+  if (cleanData.length === 0) throw new Error('No data remaining after filtering');
+
+  // 4. Sum aging columns from clean data
+  let sum0to30 = 0;
+  let sum31to60 = 0;
+  let sum61to90 = 0;
+  let sum91to120 = 0;
+  let sum120plus = 0;
+  let sumTotal = 0;
+
+  cleanData.forEach(row => {
+    sum0to30 += parseNum(row[col0to30 - 1]);
+    sum31to60 += parseNum(row[col31to60 - 1]);
+    sum61to90 += parseNum(row[col61to90 - 1]);
+    sum91to120 += parseNum(row[col91to120 - 1]);
+    sum120plus += parseNum(row[col120plus - 1]);
+    sumTotal += parseNum(row[colTotal - 1]);
+  });
+
+  // Show update toast
+  ss.toast('Updating Weekly KPIs...', 'AR Report', -1);
+
+  // 5. Find matching week in Weekly KPIs tab
+  const kpiLastRow = kpiSheet.getLastRow();
+  const weekColumn = kpiSheet.getRange(1, 1, kpiLastRow, 1).getDisplayValues();
+
+  let targetRow = null;
+  for (let i = 0; i < weekColumn.length; i++) {
+    if (String(weekColumn[i][0]).trim() === String(weekNum).trim()) {
+      targetRow = i + 1;
+      break;
+    }
+  }
+
+  if (!targetRow) throw new Error(`Week ${weekNum} not found in Weekly KPIs tab`);
+
+  // 6. Find AR columns in Weekly KPIs header (row 2) - dynamic search
+  const kpiHeaderRow = 2;
+  const kpiLastCol = kpiSheet.getLastColumn();
+  const kpiHeader = kpiSheet.getRange(kpiHeaderRow, 1, 1, kpiLastCol).getDisplayValues()[0];
+
+  const kpiCols = {
+    '0-30 Days': kpiHeader.indexOf('0-30 Days') + 1,
+    '31-60 Days': kpiHeader.indexOf('31-60 Days') + 1,
+    '61-90 Days': kpiHeader.indexOf('61-90 Days') + 1,
+    '91-120 Days': kpiHeader.indexOf('91-120 Days') + 1,
+    'Over 120 Days': kpiHeader.indexOf('Over 120 Days') + 1,
+    'Total': kpiHeader.indexOf('Total') + 1
+  };
+
+  // Check for missing columns
+  const missingKpiCols = Object.keys(kpiCols).filter(col => !kpiCols[col] || kpiCols[col] === 0);
+  if (missingKpiCols.length) {
+    throw new Error('Missing AR columns in Weekly KPIs: ' + missingKpiCols.join(', '));
+  }
+
+  // 7. Write results to found columns
+  kpiSheet.getRange(targetRow, kpiCols['0-30 Days']).setValue(sum0to30);
+  kpiSheet.getRange(targetRow, kpiCols['31-60 Days']).setValue(sum31to60);
+  kpiSheet.getRange(targetRow, kpiCols['61-90 Days']).setValue(sum61to90);
+  kpiSheet.getRange(targetRow, kpiCols['91-120 Days']).setValue(sum91to120);
+  kpiSheet.getRange(targetRow, kpiCols['Over 120 Days']).setValue(sum120plus);
+  kpiSheet.getRange(targetRow, kpiCols['Total']).setValue(sumTotal);
+
+  // 8. Clear AR Report Tab and restore instructions
+  arSheet.clear();
+
+  // Hide gridlines
+  arSheet.setHiddenGridlines(true);
+
+  // A1: "Week Number:" (bold)
+  arSheet.getRange('A1').setValue('Week Number:').setFontWeight('bold');
+
+  // B1: soft yellow highlight
+  arSheet.getRange('B1').setBackground('#FFFACD');
+
+  // A3: "Instructions:" (bold)
+  arSheet.getRange('A3').setValue('Instructions:').setFontWeight('bold');
+
+  // A4: Instructions text (10pt, wrapped)
+  const instructions = `• Enter Week Number in cell B1 above
+• In Daxko Operations: Finance > Collections Manager
+   • Branch Type: "Revenue"
+   • Branch: select your branch
+   • Aging Increments: 30 day
+• Click "View", then "Download"
+• While on the Summary tab, copy entire report (click upper-left corner and copy)
+• Paste at cell A11 (highlighted below)
+• Click "Process Collections" button`;
+
+  arSheet.getRange('A4').setValue(instructions)
+    .setWrap(true);
+
+  // Merge A4:G8 for instructions to fit
+  arSheet.getRange('A4:G8').merge();
+
+  // A11: "Paste Here" (soft yellow highlight)
+  arSheet.getRange('A11').setValue('Paste Here')
+    .setBackground('#FFFACD')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+
+  // Apply Verdana font size 9 to all populated cells
+  arSheet.getDataRange().setFontFamily('Verdana').setFontSize(9);
+
+  // Override instructions to be size 10
+  arSheet.getRange('A4').setFontSize(10);
+
+  // 9. Switch to Weekly KPIs tab
+  kpiSheet.activate();
+
+  // Show success toast
+  ss.toast(`Week ${weekNum} processed successfully!`, 'AR Report Complete', 5);
+
+  SpreadsheetApp.getUi().alert(`Week ${weekNum} processed successfully!\n\n` +
+    `0-30 Days: $${sum0to30.toFixed(2)}\n` +
+    `31-60 Days: $${sum31to60.toFixed(2)}\n` +
+    `61-90 Days: $${sum61to90.toFixed(2)}\n` +
+    `91-120 Days: $${sum91to120.toFixed(2)}\n` +
+    `Over 120 Days: $${sum120plus.toFixed(2)}\n` +
+    `Total AR: $${sumTotal.toFixed(2)}`);
+}
+
+// Helper function to parse currency values
+function parseNum(val) {
+  if (val === '' || val === null || val === undefined) return 0;
+  const s = String(val).replace(/\$/g, '').replace(/,/g, '').trim();
+  const n = Number(s);
+  return isNaN(n) ? 0 : n;
+}
