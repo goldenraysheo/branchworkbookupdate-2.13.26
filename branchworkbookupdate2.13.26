@@ -144,7 +144,7 @@ function processRawUpload() {
   if (AUTO_ARCHIVE) archiveRaw_(ss, raw, periodCode);
 
   // Show overview update toast
-  ss.toast('Updating Branch & Dept overviews...', 'Variance Report', -1);
+  ss.toast('Updating Branch Overview & Dept View...', 'Variance Report', -1);
 
   // Update Branch & Dept overviews based on all Archive_P#-Mon sheets (includes 2100)
   updateBranchOverview_(ss);
@@ -780,42 +780,15 @@ if (last >= 1) {
 }
 
 /**
- * NEW: Dept Overview built from all Archive_P#-Mon sheets.
+ * Dept View built from all Archive_P#-Mon sheets.
  * Uses Dept_Names sheet for department names.
  */
 function updateDeptOverview_(ss) {
-  // Obtain a writable "Dept Overview" sheet. The old one may be locked by a
-  // protection that the current user cannot remove or even delete, so we try
-  // three approaches in order:
-  //   1. Delete the old sheet and create a fresh one (ideal).
-  //   2. Rename / hide the old sheet, then create a new one with the correct name.
-  //   3. Leave the old sheet alone and create "Dept Overview (new)".
-  const existing = ss.getSheetByName('Dept Overview');
-  if (!existing) return;
+  const overview = ss.getSheetByName('Dept View');
+  if (!overview) return;
 
-  let overview;
-  try {
-    // Attempt 1 — delete the old sheet entirely
-    const pos = existing.getIndex();
-    ss.deleteSheet(existing);
-    overview = ss.insertSheet('Dept Overview', pos - 1);
-  } catch (e1) {
-    try {
-      // Attempt 2 — rename + hide the locked sheet, then create a clean one
-      existing.setName('_Dept Overview (locked - safe to delete)');
-      try { existing.hideSheet(); } catch (hideErr) { /* ignore */ }
-      overview = ss.insertSheet('Dept Overview');
-    } catch (e2) {
-      // Attempt 3 — can't touch the old sheet at all; use a new name
-      overview = ss.insertSheet('Dept Overview (new)');
-      ss.toast(
-        'The old "Dept Overview" tab is locked by another user\'s protection and could not be removed. ' +
-        'Your updated data is in the "Dept Overview (new)" tab. ' +
-        'Ask the person who originally ran the tool to delete the old tab, or make a copy of this spreadsheet (File → Make a copy).',
-        'Notice', 15
-      );
-    }
-  }
+  // Clear any stale data (sheet already exists as a blank tab)
+  overview.clear();
 
   // Build dept code -> name map from Dept_Names sheet
   const deptNameSheet = ss.getSheetByName('Dept_Names');
@@ -1001,8 +974,7 @@ function updateDeptOverview_(ss) {
     ];
   });
 
-  // ---- Write to Dept Overview ----
-  overview.clear();
+  // ---- Write to Dept View ----
   overview.getRange(1,1,1,header.length).setValues([header]);
   overview.getRange(2,1,out.length,header.length).setValues(out);
 
@@ -1010,12 +982,7 @@ function updateDeptOverview_(ss) {
   overview.setFrozenRows(1);
   overview.getDataRange().setFontFamily('Verdana').setFontSize(9);
   overview.getRange(1,1,1,header.length).setFontWeight('bold');
-  // Formatting
-overview.setFrozenRows(1);
-overview.getDataRange().setFontFamily('Verdana').setFontSize(9);
-overview.getRange(1,1,1,header.length).setFontWeight('bold');
-// NEW: wrap header row text
-overview.getRange(1,1,1,header.length).setWrap(true);
+  overview.getRange(1,1,1,header.length).setWrap(true);
 
   const existingFilter = overview.getFilter();
   if (existingFilter) existingFilter.remove();
@@ -1100,29 +1067,6 @@ if (last >= 1) {
     });
 
     overview.setConditionalFormatRules(rules);
-      // --- Protect Dept Overview (view-only for all non-owners/editors) ---
-  {
-    // Protect entire sheet (no need to remove old protections — sheet was recreated fresh)
-    const prot = overview.protect().setDescription('Dept Overview - Locked');
-
-    // Keep both the spreadsheet owner and current user as editors.
-    // This prevents the owner from being locked out when someone else runs the script.
-    const me = Session.getEffectiveUser().getEmail();
-    const owner = ss.getOwner();
-    const ownerEmail = owner ? owner.getEmail() : null;
-    const keepEmails = ownerEmail ? [me, ownerEmail] : [me];
-
-    prot.removeEditors(prot.getEditors().filter(e => !keepEmails.includes(e.getEmail())));
-    if (ownerEmail && ownerEmail !== me) {
-      prot.addEditor(ownerEmail);
-    }
-
-    // Ensure domain-wide / group editors can't override
-    if (prot.canDomainEdit()) {
-      prot.setDomainEdit(false);
-    }
-  }
-
   }
 }
 
